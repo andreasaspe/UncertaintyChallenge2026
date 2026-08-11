@@ -85,18 +85,47 @@ class IWildCamChallengeDataset(Dataset):
         return img, int(self.labels[idx])
 
 
-def default_train_transform() -> Callable:
+def default_train_transform(img_size: int = IMG_SIZE) -> Callable:
+    """Training augmentation, tuned for camera-trap imagery.
+
+    Each piece targets a specific way this dataset varies across camera
+    locations — the thing that makes held-out locations ("ood") hard:
+
+    - ``RandomResizedCrop`` replaces a plain squashing ``Resize``. Animals are
+      often a small blob in a corner, so random zoom/crop both preserves
+      aspect ratio and forces the model to recognise species at many apparent
+      scales instead of memorising "big centred animal".
+    - ``ColorJitter`` covers exposure/white-balance differences between
+      cameras — a major part of what changes at a new location.
+    - ``RandomGrayscale`` matters because camera traps switch to infrared at
+      night, so a chunk of the data is effectively greyscale. Randomly
+      dropping colour stops the model leaning on colour cues that vanish
+      after dark.
+
+    ``scale=(0.6, 1.0)`` is deliberately not the ImageNet default of 0.08 —
+    aggressive cropping would frequently cut the animal out of the frame
+    entirely and hand the model a mislabelled image.
+    """
     return transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.RandomResizedCrop(img_size, scale=(0.6, 1.0), ratio=(0.75, 1.333)),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05),
+        transforms.RandomGrayscale(p=0.15),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
 
 
-def default_eval_transform() -> Callable:
+def default_eval_transform(img_size: int = IMG_SIZE) -> Callable:
+    """Deterministic eval transform: resize the *whole* frame, no cropping.
+
+    Deliberately not the usual Resize-then-CenterCrop: a centre crop would
+    discard the frame edges, and camera-trap animals frequently sit right at
+    the edge. Keeping the full field of view costs some aspect-ratio
+    distortion but never throws the subject away.
+    """
     return transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])

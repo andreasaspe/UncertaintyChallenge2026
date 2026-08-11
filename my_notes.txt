@@ -1,6 +1,6 @@
 python -m student.train \
     --data-root /mnt/c/data/uncertainty_data/challenge_data \
-    --output-dir /mnt/c/data/uncertainty_data/challenge_data/runs/baseline \
+    --output-dir /mnt/c/data/uncertainty_data/challenge_data/runs/baseline_pretrained \
     --epochs 30 \
     --batch-size 32 \
     --lr 1e-4 \
@@ -12,6 +12,12 @@ python -m student.train \
 python -m student.eval \
     --checkpoint /mnt/c/data/uncertainty_data/challenge_data/runs/baseline/model_temp_scaled.pt \
     --data-root /mnt/c/data/uncertainty_data/challenge_data
+
+
+python -m student.predict \
+    --checkpoint /mnt/c/data/uncertainty_data/challenge_data/runs/baseline/model_temp_scaled.pt \
+    --data-root /mnt/c/data/uncertainty_data/challenge_data \
+    --output submission.csv
 
 
 
@@ -34,3 +40,8 @@ root /mnt/c/data/uncertainty_data/challenge_data
   "brier": 1.1223175525665283,
   "misclassification_auroc": 0.6243821057834898
 }
+
+
+Other notes:
+Each targets a specific way locations differ: the crop stops the model memorizing "big centered animal" and forces scale-invariance, the jitter covers per-camera exposure/white-balance, and the grayscale covers the fact that camera traps switch to infrared at night. I used scale=(0.6, 1.0) rather than ImageNet's usual 0.08 deliberately — aggressive cropping would routinely cut the animal out of frame and hand the model a mislabeled image.
+

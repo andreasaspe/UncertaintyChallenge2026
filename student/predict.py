@@ -63,12 +63,12 @@ def predict(
     splits: tuple[str, ...] = DEFAULT_SPLITS,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, T = load_checkpoint(checkpoint, device)
+    model, T, img_size = load_checkpoint(checkpoint, device)
 
     all_uids: list[str] = []
     all_probs: list[np.ndarray] = []
     for split in splits:
-        ds = IWildCamChallengeDataset(data_root, split, default_eval_transform())
+        ds = IWildCamChallengeDataset(data_root, split, default_eval_transform(img_size))
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
         uids, probs = collect_test_predictions(model, loader, device, temperature=T)
         all_uids.extend(uids)

@@ -24,18 +24,25 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from student.data import IWildCamChallengeDataset, default_eval_transform
+from student.data import IMG_SIZE, IWildCamChallengeDataset, default_eval_transform
 from student.metrics import compute_all_metrics
 from student.model import DEFAULT_BACKBONE, Classifier
 
 
-def load_checkpoint(ckpt_path: Path, device) -> tuple[nn.Module, float]:
+def load_checkpoint(ckpt_path: Path, device) -> tuple[nn.Module, float, int]:
+    """Return ``(model, temperature, img_size)``.
+
+    ``img_size`` comes from the checkpoint's ``hyperparameters`` so every
+    consumer evaluates at the resolution the model was trained at. Older
+    checkpoints predate the field and fall back to the 224 default.
+    """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     backbone_name = ckpt.get("backbone", DEFAULT_BACKBONE)
     model = Classifier(int(ckpt["num_classes"]), backbone_name=backbone_name)
     model.load_state_dict(ckpt["state_dict"])
     model.to(device).eval()
-    return model, float(ckpt.get("temperature", 1.0))
+    img_size = int(ckpt.get("hyperparameters", {}).get("img_size", IMG_SIZE))
+    return model, float(ckpt.get("temperature", 1.0)), img_size
 
 
 def collect_predictions(
@@ -101,8 +108,8 @@ def main() -> None:
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, temperature = load_checkpoint(args.checkpoint, device)
-    val_ds = IWildCamChallengeDataset(args.data_root, "val", default_eval_transform())
+    model, temperature, img_size = load_checkpoint(args.checkpoint, device)
+    val_ds = IWildCamChallengeDataset(args.data_root, "val", default_eval_transform(img_size))
     metrics = evaluate_by_domain(
         model, val_ds, device, temperature,
         batch_size=args.batch_size, num_workers=args.num_workers,

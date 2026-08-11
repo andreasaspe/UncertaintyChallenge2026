@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from student import metrics as M
 from student.data import (
+    IMG_SIZE,
     IWildCamChallengeDataset,
     default_eval_transform,
     default_train_transform,
@@ -239,6 +240,7 @@ def train(
     weight_decay: float = 1e-4,
     patience: int = 3,
     num_workers: int = 4,
+    img_size: int = IMG_SIZE,
     backbone: str = DEFAULT_BACKBONE,
     pretrained: bool = False,
     early_stop_metric: str = "accuracy",
@@ -255,6 +257,7 @@ def train(
         "weight_decay": float(weight_decay),
         "patience": int(patience),
         "num_workers": int(num_workers),
+        "img_size": int(img_size),
         "backbone": str(backbone),
         "pretrained": bool(pretrained),
         "early_stop_metric": str(early_stop_metric),
@@ -262,8 +265,11 @@ def train(
     }
     (output_dir / "config.json").write_text(json.dumps(hparams, indent=2))
 
-    train_ds = IWildCamChallengeDataset(data_root, "train", default_train_transform())
-    val_ds = IWildCamChallengeDataset(data_root, "val", default_eval_transform())
+    # img_size is recorded in hparams -> checkpoint, so eval/predict/ood all
+    # reproduce the exact resolution this model was trained at. Evaluating a
+    # 320px model at 224px would silently wreck its accuracy.
+    train_ds = IWildCamChallengeDataset(data_root, "train", default_train_transform(img_size))
+    val_ds = IWildCamChallengeDataset(data_root, "val", default_eval_transform(img_size))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
@@ -311,6 +317,9 @@ def main() -> None:
                         help="Which val metric drives early stopping. Default is "
                              "accuracy: we teach accuracy-first, calibration-second.")
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--img-size", type=int, default=IMG_SIZE,
+                        help="Input resolution. Camera-trap animals are often tiny in "
+                             "frame, so 288/320 can recover detail 224 throws away.")
     parser.add_argument("--backbone", type=str, default=DEFAULT_BACKBONE,
                         help="timm model id (e.g. resnet50, resnet18, convnext_small, vit_base_patch16_224).")
     parser.add_argument("--pretrained", action="store_true",
