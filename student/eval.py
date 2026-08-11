@@ -61,6 +61,36 @@ def evaluate(
     return compute_all_metrics(probs, labels)
 
 
+def evaluate_by_domain(
+    model: nn.Module,
+    val_ds: IWildCamChallengeDataset,
+    device,
+    temperature: float = 1.0,
+    batch_size: int = 32,
+    num_workers: int = 4,
+) -> dict[str, dict]:
+    """Metrics on all of val, plus separately for each `domain` value ('id'/'ood').
+
+    `val`'s domain column marks whether a row is from a camera location seen
+    in train ('id') or a held-out location ('ood') — splitting the metrics
+    this way shows whether a model is quietly overconfident on OOD data even
+    when its aggregate numbers look fine.
+
+    Uses `shuffle=False` so prediction rows line up 1:1, in order, with
+    `val_ds.domains`.
+    """
+    loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    probs, labels = collect_predictions(model, loader, device, temperature)
+
+    results = {"overall": compute_all_metrics(probs, labels)}
+    if val_ds.domains is not None:
+        domains = np.asarray(val_ds.domains)
+        for domain in sorted(set(val_ds.domains)):
+            mask = domains == domain
+            results[domain] = compute_all_metrics(probs[mask], labels[mask])
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a checkpoint on the val split.")
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -73,9 +103,10 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, temperature = load_checkpoint(args.checkpoint, device)
     val_ds = IWildCamChallengeDataset(args.data_root, "val", default_eval_transform())
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers)
-    metrics = evaluate(model, val_loader, device, temperature)
+    metrics = evaluate_by_domain(
+        model, val_ds, device, temperature,
+        batch_size=args.batch_size, num_workers=args.num_workers,
+    )
     print(json.dumps(metrics, indent=2))
 
 

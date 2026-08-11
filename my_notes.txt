@@ -1,0 +1,36 @@
+python -m student.train \
+    --data-root /mnt/c/data/uncertainty_data/challenge_data \
+    --output-dir /mnt/c/data/uncertainty_data/challenge_data/runs/baseline \
+    --epochs 30 \
+    --batch-size 32 \
+    --lr 1e-4 \
+    --head-lr 1e-3 \
+    --patience 3
+
+
+
+python -m student.eval \
+    --checkpoint /mnt/c/data/uncertainty_data/challenge_data/runs/baseline/model_temp_scaled.pt \
+    --data-root /mnt/c/data/uncertainty_data/challenge_data
+
+
+
+
+Results so far
+ python -m student.eval     --checkpoint /mnt/c/data/uncertainty_data/challenge_data/runs/baseline/model_temp_scaled.pt     --data-root /mnt/c/data/uncertainty_data/challenge_data
+{
+  "accuracy": 0.2222222222222222,
+  "ece": 0.05631765383163829,
+  "nll": 3.127300977706909,
+  "brier": 0.9106542468070984,
+  "misclassification_auroc": 0.6306983577744824
+}
+(ss26) awias@COMP-nb5829:~/code/UncertaintyChallenge2026$ python -m student.eval     --checkpoint /mnt/c/data/uncertainty_data/challenge_data/runs/baseline/model.pt     --data-
+root /mnt/c/data/uncertainty_data/challenge_data
+{
+  "accuracy": 0.2222222222222222,
+  "ece": 0.40552001944814114,
+  "nll": 5.417947769165039,
+  "brier": 1.1223175525665283,
+  "misclassification_auroc": 0.6243821057834898
+}
