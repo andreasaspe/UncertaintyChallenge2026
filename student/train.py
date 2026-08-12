@@ -241,6 +241,8 @@ def train(
     patience: int = 3,
     num_workers: int = 4,
     img_size: int = IMG_SIZE,
+    label_smoothing: float = 0.0,
+    augment: str = "full",
     backbone: str = DEFAULT_BACKBONE,
     pretrained: bool = False,
     early_stop_metric: str = "accuracy",
@@ -258,6 +260,8 @@ def train(
         "patience": int(patience),
         "num_workers": int(num_workers),
         "img_size": int(img_size),
+        "label_smoothing": float(label_smoothing),
+        "augment": str(augment),
         "backbone": str(backbone),
         "pretrained": bool(pretrained),
         "early_stop_metric": str(early_stop_metric),
@@ -268,7 +272,7 @@ def train(
     # img_size is recorded in hparams -> checkpoint, so eval/predict/ood all
     # reproduce the exact resolution this model was trained at. Evaluating a
     # 320px model at 224px would silently wreck its accuracy.
-    train_ds = IWildCamChallengeDataset(data_root, "train", default_train_transform(img_size))
+    train_ds = IWildCamChallengeDataset(data_root, "train", default_train_transform(img_size, augment))
     val_ds = IWildCamChallengeDataset(data_root, "val", default_eval_transform(img_size))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=num_workers, drop_last=False)
@@ -280,7 +284,13 @@ def train(
     ).to(device)
     optimizer = make_optimizer(model, lr_backbone=lr, lr_head=head_lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-    criterion = nn.CrossEntropyLoss()
+    # Label smoothing: instead of training toward a hard 1.0 on the true class,
+    # train toward (1 - eps) and spread eps over the others. That removes the
+    # incentive to push logits toward infinity, which is what drives val NLL up
+    # while accuracy stalls. Regularises AND improves calibration.
+    # NOTE: only the *training* loss is smoothed. fit_temperature() above must
+    # keep plain CrossEntropyLoss -- calibration is fit against true NLL.
+    criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     trainer = Trainer(
         model=model, train_loader=train_loader, val_loader=val_loader,
@@ -310,6 +320,12 @@ def main() -> None:
     parser.add_argument("--head-lr", type=float, default=1e-3,
                         help="Head learning rate (higher LR for the new classification layer).")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--augment", type=str, default="full", choices=["full", "basic"],
+                        help="'full' = crop/jitter/grayscale; 'basic' = starter-kit "
+                             "resize+flip. Use 'basic' to ablate augmentation.")
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="CrossEntropy label smoothing eps (0.1 is a good default). "
+                             "Regularises AND improves calibration.")
     parser.add_argument("--patience", type=int, default=3,
                         help="Early-stop after this many epochs without val-metric improvement.")
     parser.add_argument("--early-stop-metric", type=str, default="accuracy",

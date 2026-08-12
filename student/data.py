@@ -85,11 +85,18 @@ class IWildCamChallengeDataset(Dataset):
         return img, int(self.labels[idx])
 
 
-def default_train_transform(img_size: int = IMG_SIZE) -> Callable:
+def default_train_transform(img_size: int = IMG_SIZE, augment: str = "full") -> Callable:
     """Training augmentation, tuned for camera-trap imagery.
 
-    Each piece targets a specific way this dataset varies across camera
-    locations — the thing that makes held-out locations ("ood") hard:
+    ``augment="basic"`` reproduces the original starter-kit pipeline (squash
+    resize + horizontal flip) so the heavy augmentation below can be ablated
+    against it under otherwise identical hyperparameters. Run A compared
+    augmentation against the baseline while the training dynamics were also
+    broken, so its effect has never actually been isolated.
+
+    Each piece of the "full" pipeline targets a specific way this dataset
+    varies across camera locations — the thing that makes held-out locations
+    ("ood") hard:
 
     - ``RandomResizedCrop`` replaces a plain squashing ``Resize``. Animals are
       often a small blob in a corner, so random zoom/crop both preserves
@@ -106,6 +113,15 @@ def default_train_transform(img_size: int = IMG_SIZE) -> Callable:
     aggressive cropping would frequently cut the animal out of the frame
     entirely and hand the model a mislabelled image.
     """
+    if augment == "basic":
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ])
+    if augment != "full":
+        raise ValueError(f"augment must be 'full' or 'basic', got {augment!r}")
     return transforms.Compose([
         transforms.RandomResizedCrop(img_size, scale=(0.6, 1.0), ratio=(0.75, 1.333)),
         transforms.RandomHorizontalFlip(),
