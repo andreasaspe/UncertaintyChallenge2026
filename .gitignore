@@ -1,0 +1,11 @@
+# Python bytecode — these were tracked, and since the laptop runs 3.14 and the
+# server may run a different Python, every sync produced a binary conflict.
+__pycache__/
+*.py[cod]
+
+# Run outputs and data live under the data root, not the repo, but guard anyway.
+runs/
+*.pt
+*.csv.gz
+submission*.csv
+crop_preview/

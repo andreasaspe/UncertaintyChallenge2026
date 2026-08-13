@@ -39,6 +39,7 @@ from student.data import (
     IWildCamChallengeDataset,
     default_eval_transform,
     default_train_transform,
+    check_data_root,
     make_box_cropper,
 )
 from student.model import DEFAULT_BACKBONE, DEFAULT_LORA_TARGETS, Classifier
@@ -166,6 +167,10 @@ class Trainer:
     amp_dtype: torch.dtype | None = None
     val_domains: np.ndarray | None = None
     history_path: Path | None = None
+    # Called with (epoch, temperature) every time the val metric improves, so a
+    # killed run still leaves a usable checkpoint on disk. An earlier 320px run
+    # in this project was killed at epoch 10 and lost everything.
+    save_best: object | None = None
     history: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -332,6 +337,10 @@ class Trainer:
                 self.best_state_dict = copy.deepcopy(self.model.state_dict())
                 self.best_epoch = epoch
                 self.epochs_no_improve = 0
+                if self.save_best is not None:
+                    # The model currently *is* the best state, so checkpoint it
+                    # here rather than deferring to the end of training.
+                    self.save_best(epoch, T)
             else:
                 self.epochs_no_improve += 1
                 if self.epochs_no_improve >= self.patience:
@@ -489,6 +498,9 @@ def train(
     save_merged: bool = False,
     seed: int = 0,
 ) -> None:
+    # Validate the data layout before anything expensive (a 7B backbone
+    # download is 27 GB) so a mistyped path costs a second, not an hour.
+    data_root = check_data_root(data_root, need_boxes=box_crop)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -635,17 +647,32 @@ def train(
     # soften, and NLL suffers) — default 0.0.
     criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
+    lora_only = lora_r > 0 and not save_merged
+
+    def save_best(epoch: int, T: float) -> None:
+        """Persist the new best epoch immediately, in the final on-disk format.
+
+        Writes both files the run would produce at the end, so a run that is
+        interrupted at any point leaves a checkpoint that eval/predict can use
+        as-is -- no refitting, no salvage step.
+        """
+        save_checkpoint(model, train_ds.num_classes, 1.0, output_dir / "model.pt",
+                        hyperparameters=hparams, lora_only=lora_only)
+        save_checkpoint(model, train_ds.num_classes, T,
+                        output_dir / "model_temp_scaled.pt",
+                        hyperparameters=hparams, lora_only=lora_only)
+        print(f"  checkpointed epoch {epoch} (T={T:.3f})")
+
     trainer = Trainer(
         model=model, train_loader=train_loader, val_loader=val_loader,
         optimizer=optimizer, scheduler=scheduler, criterion=criterion,
         device=device, patience=patience, early_stop_metric=early_stop_metric,
         grad_accum=grad_accum, grad_clip=grad_clip, amp_dtype=amp_dtype,
         val_domains=np.asarray(val_ds.domains) if val_ds.domains else None,
-        history_path=output_dir / "history.csv",
+        history_path=output_dir / "history.csv", save_best=save_best,
     )
     trainer.fit(epochs)
 
-    lora_only = lora_r > 0 and not save_merged
     if save_merged and lora_r > 0:
         n = model.merge_lora()
         # The adapters no longer exist as separate modules, so the checkpoint

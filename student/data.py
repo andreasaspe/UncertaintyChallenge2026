@@ -481,3 +481,44 @@ def make_box_cropper(data_root, enabled: bool = True, **kwargs) -> Optional[BoxC
             f"Pass --no-box-crop to train on full frames instead."
         )
     return BoxCropper(path, **kwargs)
+
+
+REQUIRED_SPLIT_DIRS = ("train", "val", "test_public", "test_private")
+
+
+def check_data_root(data_root, need_boxes: bool = False) -> Path:
+    """Fail fast, and say exactly what is wrong, if --data-root is misaimed.
+
+    The splits live one level below the folder people naturally think of as
+    the data directory (``uncertainty_data/challenge_data/``, not
+    ``uncertainty_data/``), so pointing one level too high is the single most
+    likely setup mistake. Without this the run dies much later inside
+    ``_num_classes`` with a bare FileNotFoundError that names only
+    ``class_mapping.json``, which does not tell you whether the root is wrong,
+    a split failed to copy, or the file is genuinely missing.
+    """
+    root = Path(data_root)
+    if not root.exists():
+        raise FileNotFoundError(f"--data-root does not exist: {root}")
+
+    missing = [name for name in REQUIRED_SPLIT_DIRS if not (root / name).is_dir()]
+    if not (root / "class_mapping.json").exists():
+        missing.append("class_mapping.json")
+    if need_boxes and not (root / "boxes.csv").exists():
+        missing.append("boxes.csv (required by --box-crop)")
+
+    if missing:
+        present = sorted(c.name for c in root.iterdir())[:12] if root.is_dir() else []
+        hint = ""
+        # The classic off-by-one-level: the real root is a child of this one.
+        for child in (root.iterdir() if root.is_dir() else []):
+            if child.is_dir() and (child / "class_mapping.json").exists():
+                hint = f"\n  Did you mean --data-root {child} ?"
+                break
+        raise FileNotFoundError(
+            f"--data-root {root} is missing: {', '.join(missing)}."
+            f"\n  It contains: {', '.join(present) or '(empty)'}"
+            f"\n  --data-root must be the directory that DIRECTLY contains "
+            f"train/ val/ test_public/ test_private/ and class_mapping.json.{hint}"
+        )
+    return root
