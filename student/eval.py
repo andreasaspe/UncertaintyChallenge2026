@@ -42,12 +42,12 @@ class EvalConfig(dict):
     the normalization statistics.
     """
 
-    def transform(self):
+    def transform(self, img_size: int | None = None):
         # When box cropping is on it applies the banner clamp itself, so the
         # torchvision transform must not crop again.
         crop_frac = 0.0 if self["box_crop"] else self["crop_frac"]
         return default_eval_transform(
-            self["img_size"], crop_frac=crop_frac,
+            img_size or self["img_size"], crop_frac=crop_frac,
             mean=self["mean"], std=self["std"],
         )
 
@@ -61,15 +61,22 @@ class EvalConfig(dict):
             strict_containment=not self["box_no_strict"],
         )
 
-    def dataset(self, data_root, split: str) -> IWildCamChallengeDataset:
+    def dataset(self, data_root, split: str, img_size: int | None = None
+                ) -> IWildCamChallengeDataset:
         """Build a dataset with the exact input pipeline this model was trained on.
 
         Single entry point so eval / predict / calibrate / ood cannot drift
         apart -- a mismatch here is silent and would only show up as an
         unexplained accuracy drop.
+
+        ``img_size`` overrides the training resolution, which is what
+        multi-scale TTA needs. It re-resizes from the *original* image rather
+        than upsampling an already-downsampled tensor, so a larger scale
+        actually carries more detail instead of just more pixels.
         """
         return IWildCamChallengeDataset(
-            data_root, split, self.transform(), box_cropper=self.box_cropper(data_root)
+            data_root, split, self.transform(img_size),
+            box_cropper=self.box_cropper(data_root),
         )
 
 
@@ -184,6 +191,7 @@ def collect_logits(
     device,
     amp: bool = False,
     tta_hflip: bool = False,
+    hflip_only: bool = False,
     progress: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run ``model`` over ``loader``; return ``(logits, targets)`` as np arrays.
@@ -219,6 +227,10 @@ def collect_logits(
     batches = tqdm(loader, desc=progress, unit="batch") if progress else loader
     for imgs, targets in batches:
         imgs = imgs.to(device, non_blocking=True)
+        if hflip_only:
+            # Run this one view mirrored. Used by collect_logits_tta, which
+            # does its own averaging across views.
+            imgs = torch.flip(imgs, dims=[3])
         with ctx:
             logits = model(imgs).float()
             if tta_hflip:
@@ -229,6 +241,115 @@ def collect_logits(
         all_logits.append(logits.cpu().numpy())
         all_targets.append(np.asarray(targets))
     return np.concatenate(all_logits, axis=0), np.concatenate(all_targets, axis=0)
+
+
+# --------------------------------------------------------------------------
+# test-time augmentation
+# --------------------------------------------------------------------------
+
+# Named TTA policies, cheapest first. Kept as a small fixed menu rather than
+# free-form flags so that whatever `calibrate` selects can be recorded in the
+# checkpoint by name and reproduced exactly by `predict`.
+TTA_POLICIES: dict[str, dict] = {
+    "none":        {"scales": None, "hflip": False},
+    "hflip":       {"scales": None, "hflip": True},
+    "scales":      {"scales": (1.0, 1.25), "hflip": False},
+    "hflip+scales": {"scales": (1.0, 1.25), "hflip": True},
+}
+
+
+def tta_views(policy: str, base_img_size: int) -> list[tuple[int, bool]]:
+    """Expand a policy name into ``[(img_size, flip), ...]``.
+
+    Only two axes are used, both chosen because they are *label-preserving* on
+    camera-trap imagery:
+
+    - **Horizontal flip.** A mirrored animal is the same species. (Vertical
+      flip is deliberately absent: nothing in this dataset is upside down, so
+      it would push the model off its training distribution rather than
+      probing a genuine invariance.)
+    - **Scale.** Animals appear at wildly different apparent sizes, and the
+      box crop already normalises that only approximately. 1.25x of the
+      training resolution is a mild, safe step; the image is re-resized from
+      the original file, so it genuinely carries more detail.
+
+    Photometric augmentation (jitter, grayscale, blur) is *not* used at test
+    time. It helps during training by forcing invariance, but at inference it
+    only degrades each view, and averaging degraded predictions is worse than
+    averaging good ones.
+    """
+    if policy not in TTA_POLICIES:
+        raise ValueError(f"unknown TTA policy {policy!r}; choose from {sorted(TTA_POLICIES)}")
+    spec = TTA_POLICIES[policy]
+    scales = spec["scales"] or (1.0,)
+    flips = (False, True) if spec["hflip"] else (False,)
+    views = []
+    for s in scales:
+        # Round to a multiple of the ViT patch size so no partial patch is
+        # created at the border.
+        size = int(round(base_img_size * s / 16)) * 16
+        for f in flips:
+            views.append((size, f))
+    return views
+
+
+def collect_logits_tta(
+    model: nn.Module,
+    cfg: "EvalConfig",
+    data_root,
+    split: str,
+    device,
+    policy: str = "none",
+    batch_size: int = 32,
+    num_workers: int = 4,
+    amp: bool = False,
+    progress: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Average predictions over the TTA views; return ``(logits, targets, raw)``.
+
+    Averaging is done in **probability** space (arithmetic mean), not logit
+    space. Averaging logits is a geometric mean of probabilities, which keeps
+    the result about as sharp as the individual views and so throws away the
+    calibration benefit -- the whole reason TTA helps ECE/NLL/Brier is that
+    disagreement between views *should* show up as reduced confidence. It also
+    means TTA can move accuracy and misclassification AUROC, unlike a pure
+    recalibration, because the argmax and the confidence ranking both change.
+
+    The averaged probabilities are returned as ``log(p)`` so that everything
+    downstream keeps working on a logit-shaped array; ``softmax(log(p)/T)``
+    behaves exactly as temperature scaling should.
+
+    ``raw`` is the single-view (first view, unflipped) logit array, so callers
+    can compare against the no-TTA baseline without a second pass.
+    """
+    views = tta_views(policy, int(cfg["img_size"]))
+    summed: np.ndarray | None = None
+    targets: np.ndarray | None = None
+    raw: np.ndarray | None = None
+
+    for i, (size, flip) in enumerate(views):
+        ds = cfg.dataset(data_root, split, img_size=size)
+        loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers)
+        label = f"{split} tta {i+1}/{len(views)} ({size}px{', flip' if flip else ''})"
+        logits, tgt = collect_logits(
+            model, loader, device, amp=amp, tta_hflip=False,
+            hflip_only=flip, progress=label if progress else None,
+        )
+        probs = _softmax(logits)
+        summed = probs if summed is None else summed + probs
+        if targets is None:
+            targets, raw = tgt, logits
+
+    mean_probs = summed / len(views)
+    return np.log(np.clip(mean_probs, 1e-12, None)), targets, raw
+
+
+def _softmax(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=np.float64)
+    z = z - z.max(axis=1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
 
 
 def collect_predictions(
@@ -300,8 +421,10 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--amp", action="store_true",
                         help="bf16 autocast during eval. Faster, but perturbs ECE/AUROC slightly.")
-    parser.add_argument("--tta-hflip", action="store_true",
-                        help="Average predictions over the image and its mirror.")
+    parser.add_argument("--tta", type=str, default="auto",
+                        choices=sorted(TTA_POLICIES) + ["auto"],
+                        help="Test-time augmentation policy. 'auto' uses whatever "
+                             "student.calibrate stored in the checkpoint.")
     parser.add_argument("--no-calibration", action="store_true",
                         help="Ignore the checkpoint's fitted calibration (report raw softmax).")
     args = parser.parse_args()
@@ -312,17 +435,28 @@ def main() -> None:
         temperature, calibration = 1.0, None
     else:
         calibration = cfg["calibration"]
-    # If student.calibrate selected TTA, honour it automatically -- otherwise
-    # the reported metrics wouldn't match the submission predict.py produces.
-    tta_hflip = args.tta_hflip or bool((calibration or {}).get("tta_hflip", False))
 
+    tta = args.tta
+    if tta == "auto":
+        tta = str((calibration or {}).get("tta", "none"))
     val_ds = cfg.dataset(args.data_root, "val")
-    metrics = evaluate_by_domain(
-        model, val_ds, device, temperature,
-        batch_size=args.batch_size, num_workers=args.num_workers,
-        calibration=calibration, tta_hflip=tta_hflip, amp=args.amp,
+
+    logits, labels, _ = collect_logits_tta(
+        model, cfg, args.data_root, "val", device, policy=tta,
+        batch_size=args.batch_size, num_workers=args.num_workers, amp=args.amp,
     )
-    print(json.dumps(metrics, indent=2))
+    labels = np.asarray(labels, dtype=int)
+    probs = apply_calibration(logits, calibration, temperature)
+
+    results = {"overall": compute_all_metrics(probs, labels)}
+    if val_ds.domains is not None:
+        domains = np.asarray(val_ds.domains)
+        for domain in sorted(set(val_ds.domains)):
+            mask = domains == domain
+            results[domain] = compute_all_metrics(probs[mask], labels[mask])
+    print(f"TTA policy: {tta} "
+          f"({len(tta_views(tta, int(cfg['img_size'])))} view(s) per image)")
+    print(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":

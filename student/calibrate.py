@@ -65,7 +65,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from student import metrics as M
-from student.eval import apply_calibration, collect_logits, load_checkpoint
+from student.eval import (TTA_POLICIES, apply_calibration, collect_logits_tta,
+                          load_checkpoint, tta_views)
 from student.train import HIGHER_IS_BETTER_METRICS, METRIC_NAMES
 
 
@@ -244,19 +245,30 @@ def calibrate(
     folds: int = 5,
     seed: int = 0,
     tta: bool = True,
+    tta_policies: tuple[str, ...] | None = None,
 ) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, ckpt_T, cfg = load_checkpoint(checkpoint, device)
     val_ds = cfg.dataset(data_root, "val")
-    loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
     domains = np.asarray(val_ds.domains) if val_ds.domains else None
-    variants: dict[bool, np.ndarray] = {}
-    logits, labels = collect_logits(model, loader, device, tta_hflip=False)
-    labels = labels.astype(int)
-    variants[False] = logits
-    if tta:
-        variants[True], _ = collect_logits(model, loader, device, tta_hflip=True)
+
+    # Which TTA policies to weigh up. Each costs one val pass per view, so the
+    # full menu is 1 + 2 + 2 + 4 = 9 passes over 918 images.
+    if tta_policies is None:
+        tta_policies = tuple(TTA_POLICIES) if tta else ("none",)
+
+    variants: dict[str, np.ndarray] = {}
+    labels: np.ndarray | None = None
+    for policy in tta_policies:
+        n_views = len(tta_views(policy, int(cfg["img_size"])))
+        print(f"running val under TTA policy {policy!r} ({n_views} view(s))")
+        z, tgt, _ = collect_logits_tta(
+            model, cfg, data_root, "val", device, policy=policy,
+            batch_size=batch_size, num_workers=num_workers,
+        )
+        variants[policy] = z
+        if labels is None:
+            labels = np.asarray(tgt, dtype=int)
 
     fold_ids = make_folds(len(labels), folds, groups=domains, seed=seed)
 
@@ -283,18 +295,20 @@ def calibrate(
 
     print(f"\n{folds}-fold cross-validated calibration on val "
           f"(n={len(labels)}, out-of-fold metrics)\n")
-    header = f"{'method':<20}{'tta':<6}" + "".join(f"{m[:9]:>11}" for m in METRIC_NAMES) + f"{'borda':>8}"
+    header = f"{'method':<20}{'tta':<14}" + "".join(f"{m[:9]:>11}" for m in METRIC_NAMES) + f"{'borda':>8}"
     print(header)
     print("-" * len(header))
     for r in rows:
         cells = "".join(f"{r['metrics'][m]:>11.4f}" if r["metrics"][m] is not None else f"{'--':>11}"
                         for m in METRIC_NAMES)
-        print(f"{r['method']:<20}{str(r['tta']):<6}{cells}{r['borda']:>8}")
+        print(f"{r['method']:<20}{str(r['tta']):<14}{cells}{r['borda']:>8}")
 
     best = rows[0]
     kind = METHODS[best["method"]][0] if best["method"] != "none" else "temperature"
     params = best["params"] or {"T": 1.0}
-    calibration = {"method": kind, "params": params, "tta_hflip": bool(best["tta"]),
+    calibration = {"method": kind, "params": params, "tta": str(best["tta"]),
+                   # kept for older consumers that only knew about a flip flag
+                   "tta_hflip": "hflip" in str(best["tta"]),
                    "selected_as": best["method"]}
     scalar_T = float(params.get("T", 1.0))
     print(f"\nselected: {best['method']} (tta={best['tta']}) -> {kind}")
@@ -328,12 +342,16 @@ def main() -> None:
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-tta", action="store_true",
-                        help="Skip the horizontal-flip TTA variants (halves runtime).")
+                        help="Only evaluate the no-TTA variant (fastest).")
+    parser.add_argument("--tta-policies", nargs="+", default=None,
+                        choices=sorted(TTA_POLICIES),
+                        help="Which TTA policies to compare (default: all of them).")
     args = parser.parse_args()
     calibrate(
         checkpoint=args.checkpoint, data_root=args.data_root, output=args.output,
         batch_size=args.batch_size, num_workers=args.num_workers,
         folds=args.folds, seed=args.seed, tta=not args.no_tta,
+        tta_policies=tuple(args.tta_policies) if args.tta_policies else None,
     )
 
 

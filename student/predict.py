@@ -29,26 +29,32 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from student.eval import apply_calibration, collect_logits, load_checkpoint
+from student.eval import (TTA_POLICIES, apply_calibration, collect_logits,
+                          collect_logits_tta, load_checkpoint, tta_views)
 
 DEFAULT_SPLITS: tuple[str, ...] = ("test_public", "test_private")
 LOGITS_EXTRA_SPLIT = "val"
 
 
 def run_split(
-    model, ds, device, batch_size: int = 32, num_workers: int = 4,
+    model, cfg, data_root, split: str, device,
+    batch_size: int = 32, num_workers: int = 4,
     temperature: float = 1.0, calibration: dict | None = None,
-    tta_hflip: bool = False, progress: str | None = None,
+    tta: str = "none",
 ) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
     """Run one split; return ``(uids, probs, logits, labels)``.
 
     ``logits`` are the model's outputs *before* any calibration — what a
-    downstream calibrator needs. ``labels`` are the true classes on a labelled
-    split (val) and ``-1`` on the unlabelled test splits.
+    downstream calibrator needs. Under TTA they are the log of the averaged
+    probabilities, which is still uncalibrated and is what the calibrator was
+    fitted against. ``labels`` are the true classes on a labelled split (val)
+    and ``-1`` on the unlabelled test splits.
     """
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    logits, targets = collect_logits(model, loader, device, tta_hflip=tta_hflip,
-                                     progress=progress)
+    ds = cfg.dataset(data_root, split)
+    logits, targets, _ = collect_logits_tta(
+        model, cfg, data_root, split, device, policy=tta,
+        batch_size=batch_size, num_workers=num_workers,
+    )
     if ds.labels is None:
         # Unlabelled splits yield the uid as the second element.
         uids = [str(u) for u in targets]
@@ -106,22 +112,27 @@ def predict(
     batch_size: int = 32,
     num_workers: int = 4,
     splits: tuple[str, ...] = DEFAULT_SPLITS,
-    tta_hflip: bool = False,
+    tta: str = "none",
     with_logits: bool = False,
     logits_output: Path | None = None,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, T, cfg = load_checkpoint(checkpoint, device)
     calibration = cfg["calibration"]
-    # student.calibrate records whether flip-TTA won the cross-validated
-    # comparison; respect that unless the caller forces it on.
-    tta_hflip = tta_hflip or bool((calibration or {}).get("tta_hflip", False))
+    # student.calibrate records which TTA policy won its cross-validated
+    # comparison. Honour that unless the caller names one explicitly, because
+    # the calibrator was fitted against that policy's outputs -- pairing a
+    # calibrator with a different TTA policy would mis-calibrate.
+    if tta == "auto":
+        tta = str((calibration or {}).get("tta", "none"))
+    n_views = len(tta_views(tta, int(cfg["img_size"])))
+    print(f"TTA policy: {tta} ({n_views} view(s) per image)")
 
-    if with_logits and tta_hflip:
-        print("[note] flip-TTA is on, so l_* hold the log of the flip-averaged "
-              "probabilities rather than single-pass logits. They are still "
-              "uncalibrated and softmax(l/T) behaves identically, but they are "
-              "not the plain forward pass. Use --no-tta to get that.")
+    if with_logits and n_views > 1:
+        print("[note] TTA is on, so l_* hold the log of the averaged probabilities "
+              "rather than single-pass logits. Still uncalibrated, and the "
+              "calibrator was fitted against exactly these. Use --tta none for "
+              "the plain forward pass.")
 
     # The logits file wants val too; the submission must never contain it.
     run_splits = list(splits)
@@ -139,11 +150,10 @@ def predict(
         # The whole input pipeline comes from the checkpoint, not from
         # defaults: resolution, box/banner cropping and normalization all
         # have to match what the model was trained on.
-        ds = cfg.dataset(data_root, split)
         uids, probs, logits, labels = run_split(
-            model, ds, device, batch_size=batch_size, num_workers=num_workers,
-            temperature=T, calibration=calibration, tta_hflip=tta_hflip,
-            progress=f"{split} ({len(ds)} images)",
+            model, cfg, data_root, split, device,
+            batch_size=batch_size, num_workers=num_workers,
+            temperature=T, calibration=calibration, tta=tta,
         )
         if split in splits:
             sub_uids.extend(uids)
@@ -157,7 +167,7 @@ def predict(
     write_submission(sub_uids, probs, output)
     method = (calibration or {}).get("method", f"temperature (T={T:.4f})")
     print(f"wrote {output} ({len(sub_uids)} rows, {probs.shape[1]} classes, "
-          f"calibration={method}, tta_hflip={tta_hflip})")
+          f"calibration={method}, tta={tta})")
 
     if with_logits:
         path = Path(logits_output) if logits_output else \
@@ -183,8 +193,11 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--splits", nargs="+", default=list(DEFAULT_SPLITS),
                         help="Splits for the submission (default: test_public test_private).")
-    parser.add_argument("--tta-hflip", action="store_true",
-                        help="Average predictions over the image and its mirror.")
+    parser.add_argument("--tta", type=str, default="auto",
+                        choices=sorted(TTA_POLICIES) + ["auto"],
+                        help="Test-time augmentation policy. 'auto' (default) uses "
+                             "whichever policy student.calibrate selected and stored "
+                             "in the checkpoint, falling back to 'none'.")
     parser.add_argument("--with-logits", action="store_true",
                         help="Also write <output>_logits.csv with raw uncalibrated "
                              "l_0..l_{K-1} for the test splits AND val, plus split/y "
@@ -195,7 +208,7 @@ def main() -> None:
     predict(
         checkpoint=args.checkpoint, data_root=args.data_root, output=args.output,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        splits=tuple(args.splits), tta_hflip=args.tta_hflip,
+        splits=tuple(args.splits), tta=args.tta,
         with_logits=args.with_logits, logits_output=args.logits_output,
     )
 
