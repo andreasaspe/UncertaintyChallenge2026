@@ -30,9 +30,11 @@ DEFAULT_SPLITS: tuple[str, ...] = ("test_public", "test_private")
 def collect_test_predictions(
     model, loader: DataLoader, device, temperature: float = 1.0,
     calibration: dict | None = None, tta_hflip: bool = False,
+    progress: str | None = None,
 ) -> tuple[list[str], np.ndarray]:
     """Run model on the loader; return (uids in batch order, probs as np array)."""
-    logits, uids = collect_logits(model, loader, device, tta_hflip=tta_hflip)
+    logits, uids = collect_logits(model, loader, device, tta_hflip=tta_hflip,
+                                  progress=progress)
     return [str(u) for u in uids], apply_calibration(logits, calibration, temperature)
 
 
@@ -72,6 +74,7 @@ def predict(
         uids, probs = collect_test_predictions(
             model, loader, device, temperature=T,
             calibration=calibration, tta_hflip=tta_hflip,
+            progress=f"{split} ({len(ds)} images)",
         )
         all_uids.extend(uids)
         all_probs.append(probs)

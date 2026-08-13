@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from student.data import IMG_SIZE, IWildCamChallengeDataset, default_eval_transform
 from student.data import make_box_cropper
@@ -183,11 +184,17 @@ def collect_logits(
     device,
     amp: bool = False,
     tta_hflip: bool = False,
+    progress: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run ``model`` over ``loader``; return ``(logits, targets)`` as np arrays.
 
     ``targets`` are int labels for train/val and uid strings for the test
     splits, whichever the dataset yields.
+
+    ``progress`` shows a tqdm bar with that label. Off by default so library
+    callers stay quiet; ``predict`` turns it on, because inference over 8,322
+    test images through a 7B backbone is slow enough that silence is
+    indistinguishable from a hang.
 
     ``amp`` defaults to **off**. bf16 carries roughly three decimal digits,
     which is plenty for a training gradient but visibly perturbs the softmax
@@ -209,7 +216,8 @@ def collect_logits(
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
 
     all_logits, all_targets = [], []
-    for imgs, targets in loader:
+    batches = tqdm(loader, desc=progress, unit="batch") if progress else loader
+    for imgs, targets in batches:
         imgs = imgs.to(device, non_blocking=True)
         with ctx:
             logits = model(imgs).float()
@@ -231,9 +239,11 @@ def collect_predictions(
     calibration: dict | None = None,
     tta_hflip: bool = False,
     amp: bool = False,
+    progress: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Run ``model`` over ``loader`` and return ``(probs, labels)`` as np arrays."""
-    logits, labels = collect_logits(model, loader, device, amp=amp, tta_hflip=tta_hflip)
+    logits, labels = collect_logits(model, loader, device, amp=amp, tta_hflip=tta_hflip,
+                                    progress=progress)
     return apply_calibration(logits, calibration, temperature), labels
 
 
