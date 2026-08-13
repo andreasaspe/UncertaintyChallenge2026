@@ -303,3 +303,139 @@ val accuracy of any run so far**, and val_nll 1.41 at epoch 1.
 | ls224 | .6253 | .0404 | 1.554 | .5038 | .8499 | 17 |
 | lowlr224 | **.6318** | .0428 | 1.759 | .5121 | .8231 | 21 |
 | aug224 | .5523 | .0595 | 1.596 | .5671 | .8577 | 26 |
+
+---
+
+## Step 3 — DINOv3 + LoRA (new pipeline, added 2026-08-13)
+
+### What changed and why
+The convnext_tiny runs plateaued around .63 accuracy with overfitting as the
+binding constraint. The fix is a much stronger *frozen* representation
+(**DINOv3**) adapted with **LoRA**, so parameter count goes up ~300x while
+*trainable* parameter count stays around 1% of it.
+
+**LoRA** (Low-Rank Adaptation): freeze the pretrained weight `W`, learn two
+thin matrices and use `W + (alpha/r)·B@A`. `B` is initialised to zero, so at
+step 0 the model is bit-identical to pretrained DINOv3. At `r=64` on the 7B
+that is ~63M trainable out of 6.7B. This is the whole reason a 7B model is
+usable on 19k images at all — a full fine-tune would just memorise them.
+
+### New capabilities in the pipeline
+| where | what |
+|---|---|
+| `data.py` | `BoxCropper` (MegaDetector crop + banner masking), `CropBorders` (banner-only fallback); `augment="dinov3"`; `crop_frac`/`mean`/`std` threaded through both transforms |
+| `model.py` | `LoRALinear` + `apply_lora`/`merge_lora`; `feature_pool="cls_avg"`; `head={linear,mlp}`; `img_size`/`dynamic_img_size` |
+| `train.py` | bf16 autocast, gradient checkpointing, gradient accumulation (`--micro-batch-size`), per-step warmup+cosine, grad clip, seed, `history.csv` with all 5 metrics × overall/id/ood × raw/temp-scaled |
+| `eval.py` | rebuilds LoRA checkpoints from `hyperparameters`; `apply_calibration`; `collect_logits` with flip-TTA |
+| `plots.py` | **new** — `curves.png` from `history.csv` |
+| `inspect_crops.py` | **new** — before/after crop previews for visual verification |
+| `calibrate.py` | **new** — 5-fold CV comparison of 4 calibrators × {no TTA, flip TTA}, Borda-ranked |
+
+**Everything defaults to the old behaviour**, so all six existing checkpoints
+still load. Verified: `reg224` re-evaluates to exactly
+`.6296 / .03674 / 1.4035 / .49828 / .84932`.
+
+### Cropping: MegaDetector boxes (`--box-crop`), banner masking as backstop
+
+`boxes.csv` (in the data root) holds MegaDetector detections: one row per box
+with normalized corners, confidence and class (0=animal, 1=person, 2=vehicle).
+`BoxCropper` crops each image to the single rectangle containing **every**
+animal box above `--box-conf`.
+
+**Why this is worth doing** (all measured on train):
+- Median union box is 29% x 33% of the frame, so cropping is a **~2.2x linear
+  zoom** at `--box-margin 0.15`. At a fixed 256px input that turns a ~75px
+  animal into a ~250px animal — the resolution lever run G hinted at, without
+  paying for a bigger input.
+- It removes far more location-specific background than a banner crop, and
+  background is what makes held-out cameras (`ood`) hard.
+
+**Coverage: only 79% of images have a detection.** The other 21% fall back to
+the full frame minus the banner strips (i.e. the previous behaviour). This is
+not optional — dropping them would throw away 4,000 training images.
+
+**Four guards, each for a measured failure:**
+| guard | default | why |
+|---|---|---|
+| `--box-conf` | 0.2 | boxes go down to conf 0.10; 0.1→0.2 costs only 2% coverage |
+| `--box-margin` | 0.15 | detector boxes are tight; a slightly-off box clips tails/legs |
+| `--box-min-frac` | 0.30 | the p5 box is 7% of frame width — upscaling that to 256px is pure blur |
+| `--box-max-aspect` | 1.6 | a 4-animal frame produced a 560x135 (4.2:1) strip; squashed to square that is unrecognisable |
+
+**The banner conflict, and how it is resolved.** Keeping every animal in frame
+and keeping the text banner out genuinely conflict: **32% of union boxes reach
+into the bottom 5% strip**, because animals standing on the ground touch the
+bottom edge. Measured both ways over all 21,935 detected images:
+
+| setting | animals clipped | crops touching banner band |
+|---|---|---|
+| `strict_containment=True` (default) | **0** | 7,804 |
+| `strict_containment=False` | 7,804 | 0 |
+
+Neither is acceptable alone, so the default does **both**: containment wins the
+geometry argument, and `mask_banner=True` paints the strips solid black
+*before* cropping. That destroys the text while leaving the geometry intact.
+A black bar is a weak visual cue, but it is the *same* bar at every camera, so
+unlike `RM45 RAPIDFIRE` it carries no location information — which is the only
+property that matters for shortcut learning.
+
+Verified over all 21,935 detected images: **0 clipped animals, 0 out-of-range
+or degenerate crops.**
+
+**Visual check**: `python -m student.inspect_crops --data-root <root> --out-dir
+<dir>` writes before/after PNGs sampled across the awkward cases (`single`,
+`multi`, `tiny`, `large`, `edge`, `no_detection`). The left panel shows the
+masked source with every detection drawn (green = used, grey = below
+threshold) and the final crop as a red dashed box; the right panel is the
+actual crop the model receives.
+
+**What the banner contains** (confirmed by eye): `2013-05-30 6:41:53 AM …` on
+top, and **`RM45 RAPIDFIRE`** + RECONYX logo on the bottom. `RM45` is the
+**camera ID** — a direct shortcut to location and therefore to which species
+are present.
+
+Everything rides in the checkpoint `hyperparameters`, and `EvalConfig.dataset()`
+in `eval.py` is the single place that rebuilds the input pipeline, so
+`eval`/`predict`/`calibrate`/`ood` cannot drift apart from training.
+
+### `--augment dinov3` is a single-view adaptation, not a copy
+DINOv3's real pretraining augmentation is *multi-crop*: 2 global 224px views
+plus 8 local 96px views, matched against each other by self-distillation.
+Multi-crop is meaningless with a cross-entropy head (there is no second view
+to match), so `augment="dinov3"` implements the **global-crop branch alone**:
+RRC scale (0.32, 1.0) bicubic, hflip, `RandomApply(ColorJitter(.4,.4,.2,.1), p=0.8)`,
+grayscale p=0.2, blur p=0.5, solarize p=0.1 (the last two averaged across
+DINOv3's two global views).
+
+Two known risks, both flag-controlled: the default RRC aspect (0.75–1.333)
+crops a near-square region while eval squashes the full ~1.8:1 frame
+(`--rrc-ratio`), and solarize inverts bright pixels on night-time IR frames
+(`--solarize-p 0`).
+
+### Checkpoints are LoRA-only by default
+A merged 7B checkpoint is ~27 GB. `save_checkpoint(lora_only=True)` stores only
+the adapters + head (~250 MB) and sets `ckpt["lora_only"]=True`;
+`eval.load_checkpoint` rebuilds the frozen base from timm with
+`pretrained=True` (deterministic — training never touched those weights) and
+loads the adapters non-strictly on top, erroring loudly if any *trainable*
+tensor is missing. `--save-merged` produces a self-contained checkpoint
+instead (and correctly rewrites `hparams["lora_r"]=0` so the loader doesn't
+re-wrap).
+
+### Gotchas hit while building this (don't repeat)
+- **Eval must run in fp32.** `collect_logits(amp=...)` defaults to **off**.
+  bf16 carries ~3 decimal digits — fine for a gradient, but it perturbs the
+  softmax confidences enough to move ECE by .004 and AUROC by .0014 on this
+  918-image val set. That is larger than several of the effects we are trying
+  to measure. Opt in with `--amp` only if eval is genuinely the bottleneck.
+- **`temperature_scale` needs the same autocast as training.** With a bf16
+  frozen backbone a plain fp32 forward is a dtype mismatch — and it would only
+  crash at the *end* of a multi-hour run.
+- **`--frozen-dtype bf16` only applies when `--amp bf16`.** bf16 weights with
+  an fp32 forward pass is the same dtype mismatch.
+- **Vector scaling can change predictions.** Unlike scalar temperature, per-class
+  affine rescaling reorders logits — measured ~24% of argmaxes moved on
+  synthetic data. It is the one calibrator here that can cost accuracy.
+- timm's grad checkpointing already defaults to `use_reentrant=False`, which is
+  required: with a frozen patch embedding the reentrant version silently
+  produces no gradients.

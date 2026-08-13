@@ -22,27 +22,18 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from student.data import IWildCamChallengeDataset, default_eval_transform
-from student.eval import load_checkpoint
+from student.eval import apply_calibration, collect_logits, load_checkpoint
 
 DEFAULT_SPLITS: tuple[str, ...] = ("test_public", "test_private")
 
 
 def collect_test_predictions(
-    model, loader: DataLoader, device, temperature: float = 1.0
+    model, loader: DataLoader, device, temperature: float = 1.0,
+    calibration: dict | None = None, tta_hflip: bool = False,
 ) -> tuple[list[str], np.ndarray]:
     """Run model on the loader; return (uids in batch order, probs as np array)."""
-    model.eval()
-    uids: list[str] = []
-    probs_chunks: list[np.ndarray] = []
-    with torch.no_grad():
-        for imgs, batch_uids in loader:
-            imgs = imgs.to(device)
-            logits = model(imgs)
-            probs = torch.softmax(logits / temperature, dim=1)
-            probs_chunks.append(probs.cpu().numpy())
-            uids.extend(batch_uids)
-    return uids, np.concatenate(probs_chunks, axis=0)
+    logits, uids = collect_logits(model, loader, device, tta_hflip=tta_hflip)
+    return [str(u) for u in uids], apply_calibration(logits, calibration, temperature)
 
 
 def write_submission(uids: list[str], probs: np.ndarray, output_path: Path) -> None:
@@ -61,22 +52,35 @@ def predict(
     batch_size: int = 32,
     num_workers: int = 4,
     splits: tuple[str, ...] = DEFAULT_SPLITS,
+    tta_hflip: bool = False,
 ) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, T, img_size = load_checkpoint(checkpoint, device)
+    model, T, cfg = load_checkpoint(checkpoint, device)
+    calibration = cfg["calibration"]
+    # student.calibrate records whether flip-TTA won the cross-validated
+    # comparison; respect that unless the caller forces it on.
+    tta_hflip = tta_hflip or bool((calibration or {}).get("tta_hflip", False))
 
     all_uids: list[str] = []
     all_probs: list[np.ndarray] = []
     for split in splits:
-        ds = IWildCamChallengeDataset(data_root, split, default_eval_transform(img_size))
+        # The whole input pipeline comes from the checkpoint, not from
+        # defaults: resolution, box/banner cropping and normalization all
+        # have to match what the model was trained on.
+        ds = cfg.dataset(data_root, split)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-        uids, probs = collect_test_predictions(model, loader, device, temperature=T)
+        uids, probs = collect_test_predictions(
+            model, loader, device, temperature=T,
+            calibration=calibration, tta_hflip=tta_hflip,
+        )
         all_uids.extend(uids)
         all_probs.append(probs)
 
     probs = np.concatenate(all_probs, axis=0)
     write_submission(all_uids, probs, output)
-    print(f"wrote {output} ({len(all_uids)} rows, {probs.shape[1]} classes, T={T:.4f})")
+    method = (calibration or {}).get("method", f"temperature (T={T:.4f})")
+    print(f"wrote {output} ({len(all_uids)} rows, {probs.shape[1]} classes, "
+          f"calibration={method}, tta_hflip={tta_hflip})")
 
 
 def main() -> None:
@@ -90,11 +94,13 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--splits", nargs="+", default=list(DEFAULT_SPLITS),
                         help="Test splits to predict on (default: test_public test_private).")
+    parser.add_argument("--tta-hflip", action="store_true",
+                        help="Average predictions over the image and its mirror.")
     args = parser.parse_args()
     predict(
         checkpoint=args.checkpoint, data_root=args.data_root, output=args.output,
         batch_size=args.batch_size, num_workers=args.num_workers,
-        splits=tuple(args.splits),
+        splits=tuple(args.splits), tta_hflip=args.tta_hflip,
     )
 
 

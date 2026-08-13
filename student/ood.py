@@ -73,9 +73,9 @@ def extract_features(model, loader, device):
     return np.concatenate(feats), np.concatenate(logits), np.concatenate(targets)
 
 
-def features_for_split(model, data_root, split, device, batch_size, num_workers, img_size):
+def features_for_split(model, data_root, split, device, batch_size, num_workers, eval_cfg):
     """Features for one split, always under the *eval* transform (no augmentation)."""
-    ds = IWildCamChallengeDataset(data_root, split, default_eval_transform(img_size))
+    ds = eval_cfg.dataset(data_root, split)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     feats, logits, targets = extract_features(model, loader, device)
     return feats, logits, targets, ds
@@ -199,7 +199,9 @@ def _fmt(d: dict) -> str:
 
 def run_gate(checkpoint, data_root, cache, batch_size=128, num_workers=8, folds=5, seed=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, T_ckpt, img_size = load_checkpoint(checkpoint, device)
+    model, T_ckpt, eval_cfg = load_checkpoint(checkpoint, device)
+    # eval_cfg rebuilds the exact input pipeline this checkpoint was trained
+    # under (resolution, box/banner crop, normalization) -- see eval.EvalConfig.
 
     cache = Path(cache)
     if cache.exists():
@@ -208,8 +210,8 @@ def run_gate(checkpoint, data_root, cache, batch_size=128, num_workers=8, folds=
         va_f, va_logits, va_y, va_dom = z["va_f"], z["va_logits"], z["va_y"], z["va_dom"]
         print(f"loaded cached features from {cache}")
     else:
-        tr_f, _, tr_y, _ = features_for_split(model, data_root, "train", device, batch_size, num_workers, img_size)
-        va_f, va_logits, va_y, va_ds = features_for_split(model, data_root, "val", device, batch_size, num_workers, img_size)
+        tr_f, _, tr_y, _ = features_for_split(model, data_root, "train", device, batch_size, num_workers, eval_cfg)
+        va_f, va_logits, va_y, va_ds = features_for_split(model, data_root, "val", device, batch_size, num_workers, eval_cfg)
         va_dom = np.asarray(va_ds.domains)
         cache.parent.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(cache, tr_f=tr_f, tr_y=tr_y, va_f=va_f,
