@@ -27,7 +27,14 @@ python -m student.predict \
   --batch-size 64 --num-workers 16
 
 
-  
+
+python -m student.predict \
+  --checkpoint /data/awias/Summerschool26/uncertainty_data/challenge_data/runs/dinov3_7b/model_temp_scaled.pt \
+  --data-root /data/awias/Summerschool26/uncertainty_data/challenge_data \
+  --output submission.csv --with-logits \
+  --batch-size 64 --num-workers 16
+
+
 
 Results so far
  python -m student.eval     --checkpoint /mnt/c/data/uncertainty_data/challenge_data/runs/baseline/model_temp_scaled.pt     --data-root /mnt/c/data/uncertainty_data/challenge_data
